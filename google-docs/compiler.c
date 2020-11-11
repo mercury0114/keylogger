@@ -12,61 +12,66 @@
 
 #define C_MAX_COLS 300
 
-#define KRED "\x1B[31m"
-#define KGRN  "\x1B[32m"
-#define KNRM "\x1B[0m"
-
 // Note: on other computers path to a keyboard buffer might differ
 static const char KEYBOARD_PATH[] = "/dev/input/by-path/platform-i8042-serio-0-event-kbd";
-static const char CODE_PATH[] = "./data/original_code.cc";
-static const char CODE_PATH_AFTER_GREP[] = "./data/code_after_grep.cc";
+static const char DOCUMENT_PATH[] = "./data/document.txt";
+static const char ORIGINAL_CODE_PATH[] = "./data/original.txt";
+static const char FORMATTED_CODE_PATH[] = "./data/formatted_code.cc"; // works for python3 too
 static const char URL[] = "https://docs.google.com/document/d/1iOMIglqTnTHp7hwvD9YxZdv8umx-ArAQNvP2W3EkspE/export?format=txt";
 
-static const char TEMP_FILE[] = "./data/temp.txt";
-static const char CPP_SCRIPT[] = "./compile_cpp.sh";
-static const char CPP_COMMENT[] = "// CODE";
-static const char PYTHON_SCRIPT[] = "./compile_python.sh";
-static const char PYTHON_COMMENT[] = "## CODE";
+static const char WAIT_MESSAGE[] = "Waiting for keyboard events";
+static const char PYTHON3[] = "Python3";
+static const char PYTHON3_BEGIN_COMMENT[] = "# CODE";
+static const char PYTHON3_COMPILE_SCRIPT[] = "./compile_python.sh";
+static const char CPP[] = "CPP";
+static const char CPP_BEGIN_COMMENT[] = "// CODE";
+static const char CPP_COMPILE_SCRIPT[] = "./compile_cpp.sh";
 
 typedef struct input_event Event;
 
-typedef enum Status_ {
-    OK = 0,
-    SHELL_COMMAND_ERROR = 1,
-    NO_STARTING_COMMENT = 2,
-} Status;
+typedef struct Language_ {
+    const char* name;
+    const char* begin_comment;
+    const char* compile_script;
+} Language;
 
-bool Error(Status status) {
-    switch(status) {
-        case OK:
-            return false;
-        case SHELL_COMMAND_ERROR:
-            printf(KRED "ERROR: Shell command failed\n");
-            return true;
-        case NO_STARTING_COMMENT:
-            printf(KRED "ERROR: No starting comment found\n");
-            return true;
-    }
+static const Language SupportedLanguages[] = {
+    {PYTHON3, PYTHON3_BEGIN_COMMENT, PYTHON3_COMPILE_SCRIPT}, // Python3
+    {CPP, CPP_BEGIN_COMMENT, CPP_COMPILE_SCRIPT}, // CPP
+};
+
+static const int LANGUAGE_COUNT = sizeof(SupportedLanguages) / sizeof(Language);
+
+static void PrintRed(const char message[]) {
+    printf("\x1B[31m%s\x1B[0m", message);
 }
 
-bool EmptyFile(const char file_path[]) {
-    FILE* file = fopen(file_path, "r");
-    int size = 0;
-    if (file) {
-        fseek(file, 0, SEEK_END);
-        size = ftell(file);
+void ListSupportedLanguages() {
+    for (size_t l = 0; l < LANGUAGE_COUNT; l++) {
+        printf("%s ", SupportedLanguages[l].name);
     }
-    fclose(file);
-    return size == 0;
+    printf("\n");
 }
 
-void AddPrint(char* const line) {
+Language FindLanguage(const char name[]) {
+    for (size_t l = 0; l < LANGUAGE_COUNT; l++) {
+        if (strcmp(SupportedLanguages[l].name, name) == 0) {
+            return SupportedLanguages[l];
+        }
+    }
+    PrintRed("Your chosen language is not supported\n");
+    printf("We support: ");
+    ListSupportedLanguages();
+    exit(EXIT_FAILURE);
+}
+
+
+// for Python3 code, if we see a function call in main, we print its return value
+void MakeFunctionCallPrintReturnValue(char* const line) {
     int pos = 0;
     while (pos < C_MAX_COLS && line[pos++] != '(') {}
-    if (pos == C_MAX_COLS) return;
-
     int bracket_diff = 1;
-    while (bracket_diff > 0) {
+    while (bracket_diff > 0 && pos < C_MAX_COLS) {
         char letter = line[pos++];
         if (letter == '(') {
             bracket_diff++;
@@ -75,41 +80,55 @@ void AddPrint(char* const line) {
             bracket_diff--;
         }
     }
-    char original[C_MAX_COLS] = {0};
-    memcpy(original, line, pos);
-    sprintf(line, "print(%s)\n", original);
+    if (pos == C_MAX_COLS) return;
+
+    char temp[C_MAX_COLS] = {0};
+    memcpy(temp, line, pos);
+    sprintf(line, "print(%s)\n", temp);
 }
 
-Status Save(const char starting_comment[]) {
-    char command[300];
-    sprintf(command, "wget -q \"%s\" -O %s\n", URL, CODE_PATH);
+static bool CommandSucceeded(const char command[]) {
     FILE* file = popen(command, "r");
-    pclose(file);
-
-    sprintf(command, "grep \"%s\" %s -A 10000 > %s", starting_comment,
-		CODE_PATH, CODE_PATH_AFTER_GREP);
-    file = popen(command, "r");
     if (!file) {
-        return SHELL_COMMAND_ERROR;
+        PrintRed("Failed to run command\n");
+        pclose(file);
+        return false;
     }
-    pclose(file);
-    if (EmptyFile(CODE_PATH_AFTER_GREP)) {
-        return NO_STARTING_COMMENT;
+    char log[1000];
+    bool success = true;
+    while (fgets(log, sizeof(log), file)) {
+        success = false;
+        PrintRed(log);
+    }
+    if (WEXITSTATUS(pclose(file))) {
+        return false;
+    }
+    return success;
+}
+
+static bool CodeExtracted(const Language* const language) {
+    char command[300];
+    
+    // Finding the code segment inside the document
+    sprintf(command, "grep \"%s\" %s -A 10000 > %s", language->begin_comment,
+		DOCUMENT_PATH, ORIGINAL_CODE_PATH);
+    if (!CommandSucceeded(command)) {
+        PrintRed("No starting comment found\n");
+        return false;
     }
 
     // Reformating C++ code by adding extra includes
-    if (strcmp(starting_comment, CPP_COMMENT) == 0) {
+    if (strcmp(language->name, CPP) == 0) {
 	    sprintf(command, "cat ./cpp_include.cpp %s > %s",
-			CODE_PATH_AFTER_GREP, TEMP_FILE);
+			ORIGINAL_CODE_PATH, FORMATTED_CODE_PATH);
 	    system(command);
-	    sprintf(command, "cp %s %s", TEMP_FILE, CODE_PATH_AFTER_GREP);
-	    system(command);
+        return true;
     }
 
     // Reformatting python code by fixing identation
-    if (strcmp(starting_comment, PYTHON_COMMENT) == 0) {
-        FILE* unformatted = fopen(CODE_PATH_AFTER_GREP, "r");
-        FILE* formatted = fopen(TEMP_FILE, "w");
+    if (strcmp(language->name, PYTHON3) == 0) {
+        FILE* unformatted = fopen(ORIGINAL_CODE_PATH, "r");
+        FILE* formatted = fopen(FORMATTED_CODE_PATH, "w");
         char line[C_MAX_COLS] = {0};
         while (fgets(line, sizeof(line), unformatted)) {
             int space_count = 0;
@@ -127,36 +146,22 @@ Status Save(const char starting_comment[]) {
             }
             // If we call a function
             if (closestTo4 == 0 && line[0] >= 'A' && line[0] <= 'Z') {
-                AddPrint(line);
+                MakeFunctionCallPrintReturnValue(line);
             }
             fprintf(formatted, "%s", line);
         }
         fclose(unformatted);
         fclose(formatted);
-        sprintf(command, "mv %s %s", TEMP_FILE, CODE_PATH_AFTER_GREP);
-        system(command);
+        return true;
     }
 
-    printf(KGRN "New code downloaded and saved\n");
-    return OK;
+    return false;
 }
 
-Status Compile(const char script_name[]) {
+void CompileAndRun(const Language* const language) {
     char command[300];
-    sprintf(command, "%s %s", script_name, CODE_PATH_AFTER_GREP);
-    FILE* file = popen(command, "r");
-    if (!file) {
-        printf("Failed to run command\n");
-        pclose(file);
-        return SHELL_COMMAND_ERROR;
-    }
-    char log[1000];
-    while (fgets(log, sizeof(log), file)) {
-	    printf(KNRM "%s", log);
-    }
-    printf(KNRM "\n");
-    pclose(file);
-    return OK;
+    sprintf(command, "%s %s", language->compile_script, FORMATTED_CODE_PATH);
+    system(command);
 }
 
 void PrintIfEvent(const Event* const event) {
@@ -175,43 +180,22 @@ bool RightShiftPressed(const Event* const event) {
     return (event->value == C_KEY_PRESSED && event->code == C_RIGHT_SHIFT);
 }
 
-static void PrintNewLines(int number) {
-    for (int i = 0; i < number; i++) {
-        printf("\n");
-    }
-}
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
-        printf("ERROR: please specify language choice\n");
-        printf("supported: CPP, Python3\n");
+        PrintRed("ERROR: please specify language choice\n");
+        ListSupportedLanguages();
         return 1;
     }
-    const char* const language = argv[1];
-    bool supported = false;
-    const char* starting_comment;
-    const char* language_script;
-    if (strcmp(language, "CPP") == 0) {
-	    starting_comment = CPP_COMMENT;
-	    language_script = CPP_SCRIPT;
-	    supported = true;
-    }
-    if (strcmp(language, "Python") == 0) {
-	    starting_comment = PYTHON_COMMENT;
-	    language_script = PYTHON_SCRIPT;
-    	supported = true;   
-    }
-    if (!supported) {
-        printf(KRED "ERROR: we do not support this language\n");
-	    return 1;
-    }
+    const Language language = FindLanguage(argv[1]);
 
     FILE* keyboard_buffer = fopen(KEYBOARD_PATH, "r");
     if (keyboard_buffer == NULL) {
-        printf("Failed to open keyboard. Try running with sudo.\n");
+        PrintRed("Failed to open the keyboard file. Try running with sudo.\n");
         return 1;
     }
 
+    printf("%s\n", WAIT_MESSAGE);
     Event event;
     bool ctrl_pressed = false;
     while(1) {
@@ -220,7 +204,8 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (RightShiftPressed(&event)) {
-            PrintNewLines(100);
+            system("clear -x");
+            printf("%s\n", WAIT_MESSAGE);
             continue;
         }
         if (LeftCtrlPressed(&event)) {
@@ -232,12 +217,20 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (ctrl_pressed && event.code == C_S) {
-            if (Error(Save(starting_comment))) {
+            // Downloading the document
+            char command[300];
+            sprintf(command, "wget -q \"%s\" -O %s\n", 
+                URL, DOCUMENT_PATH);
+            system(command);
+            // Removing non-ascii characters
+            sprintf(command, "perl -pi -e 's/[^[:ascii:]]//g' %s", DOCUMENT_PATH);
+            system(command);
+            printf("Document downloaded\n");
+
+            if (!CodeExtracted(&language)) {
                 continue;
             }
-            if (Error(Compile(language_script))) {
-                continue;
-            }
+            CompileAndRun(&language);
         }
     }
 
